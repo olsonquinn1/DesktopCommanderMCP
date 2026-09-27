@@ -8,7 +8,6 @@ import os from 'os';
 import fs from 'fs/promises';
 import path from 'path';
 import { captureRemote } from '../utils/capture.js';
-import { observeTransport } from './transport-telemetry.js';
 
 export interface MCPDeviceOptions {
     persistSession?: boolean;
@@ -512,12 +511,7 @@ export class MCPDevice {
             return;
         }
 
-        const transport: 'broadcast' | 'mqtt' | undefined =
-            payload.transport === 'broadcast' || payload.transport === 'mqtt' ? payload.transport : undefined;
-        const observation = { callId: call_id, deviceId: this.deviceId, toolName: tool_name, transport };
-
         // Count every targeted delivery, including duplicates, before the local claim.
-        observeTransport({ stage: 'device_call_received', ...observation });
 
         console.log(`🔧 Received tool call ${call_id}: ${tool_name} ${JSON.stringify(tool_args)} metadata: ${JSON.stringify(metadata)}`);
 
@@ -548,7 +542,6 @@ export class MCPDevice {
 
             let result;
             executing = true;
-            observeTransport({ stage: 'execution_start', ...observation });
 
             // Handle 'ping' tool specially
             if (tool_name === 'ping') {
@@ -578,36 +571,19 @@ export class MCPDevice {
             }
 
             executing = false;
-            observeTransport({ stage: 'execution_finish', ...observation });
 
             console.log(`✅ Tool call ${tool_name} completed:\r\n ${JSON.stringify(result)}`);
 
-            // The result write itself notifies the server (a DB trigger).
-            const writeStart = observeTransport({ stage: 'operation_start', ...observation, operation: 'result_write' });
-            try {
-                await this.remoteChannel.updateCallResult(call_id, 'completed', result);
-            } finally {
-                observeTransport({ stage: 'operation_end', ...observation,
-                    operation: 'result_write', operationId: writeStart?.observation_id });
-            }
+            await this.remoteChannel.updateCallResult(call_id, 'completed', result);
 
         } catch (error: any) {
-            if (executing) {
-                observeTransport({ stage: 'execution_finish', ...observation });
-            }
             console.error(`❌ Tool call ${tool_name} failed:`, error.message);
             // The failure path must not fail: this method's promise is discarded
             // at every call site, so a throw here becomes an unhandled rejection
             // and takes the device process down.
             try {
                 await captureRemote('remote_device_tool_call_failed', { error, tool_name });
-                const writeStart = observeTransport({ stage: 'operation_start', ...observation, operation: 'result_write' });
-                try {
-                    await this.remoteChannel.updateCallResult(call_id, 'failed', null, error.message);
-                } finally {
-                    observeTransport({ stage: 'operation_end', ...observation,
-                        operation: 'result_write', operationId: writeStart?.observation_id });
-                }
+                await this.remoteChannel.updateCallResult(call_id, 'failed', null, error.message);
             } catch (reportError: any) {
                 console.error(`❌ Could not report failure for ${call_id}:`, reportError?.message);
             }

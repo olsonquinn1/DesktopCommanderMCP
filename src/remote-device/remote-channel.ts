@@ -915,8 +915,6 @@ export class RemoteChannel {
         // so a hiccup must not cost a 5-minute timeout.
         let row: any = null;
         let claimError: any = null;
-        const claimStart = observeTransport({ stage: 'operation_start', callId, deviceId: this.deviceId,
-            operation: 'claim_fetch', transport: 'broadcast' });
         for (const delayMs of [0, 500, 1500]) {
             if (delayMs > 0) await this.sleep(delayMs);
             const { data, error } = await this.client
@@ -937,10 +935,6 @@ export class RemoteChannel {
             console.debug(`[DEBUG] Doorbell claim attempt failed for ${callId}: ${error.message} — retrying`);
         }
 
-        observeTransport({ stage: 'operation_end', callId, deviceId: this.deviceId,
-            toolName: row?.tool_name, operation: 'claim_fetch', operationId: claimStart?.observation_id,
-            transport: 'broadcast' });
-
         if (row) {
             this.dispatchToolCall({ new: row, claimed: true, transport: 'broadcast' });
             return;
@@ -956,17 +950,12 @@ export class RemoteChannel {
 
         // A failed claim may never have reached the database, so read the row
         // back: still 'pending' means nobody holds it and it can be delivered.
-        const readStart = observeTransport({ stage: 'operation_start', callId, deviceId: this.deviceId,
-            operation: 'fallback_read', transport: 'broadcast' });
         const { data: current, error } = await this.client
             .from('mcp_remote_calls')
             .select('*')
             .eq('id', callId)
             .eq('device_id', this.deviceId)
             .maybeSingle();
-        observeTransport({ stage: 'operation_end', callId, deviceId: this.deviceId,
-            toolName: current?.tool_name, operation: 'fallback_read', operationId: readStart?.observation_id,
-            transport: 'broadcast' });
         if (error) {
             console.error(`[DEBUG] Doorbell row fetch failed for ${callId} after claim errors:`, error.message);
             await captureRemote('remote_channel_doorbell_fetch_error', { error });
@@ -1230,8 +1219,6 @@ export class RemoteChannel {
      */
     async markCallExecuting(callId: string, toolName?: string, transport?: 'broadcast' | 'mqtt'): Promise<boolean> {
         if (!this.client) throw new Error('Client not initialized');
-        const claimStart = observeTransport({ stage: 'operation_start', callId, deviceId: this.deviceId,
-            toolName, operation: 'fallback_claim', transport });
         const { data, error } = await this.client
             .from('mcp_remote_calls')
             .update({ status: 'executing' })
@@ -1239,9 +1226,6 @@ export class RemoteChannel {
             .eq('status', 'pending')
             .gt('timeout_at', new Date(Date.now()).toISOString())
             .select('id');
-
-        observeTransport({ stage: 'operation_end', callId, deviceId: this.deviceId,
-            toolName, operation: 'fallback_claim', operationId: claimStart?.observation_id, transport });
 
         if (error) {
             console.error('[DEBUG] Failed to mark call executing:', error.message);
