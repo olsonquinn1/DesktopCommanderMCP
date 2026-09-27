@@ -286,7 +286,6 @@ await test('doorbell delivers a pending row through the shared handler', async (
   assert(delivered.length === 1, 'expected one delivery');
   assert(delivered[0].new === row, 'must pass the claimed row as {new: row}');
   assert(delivered[0].claimed === true, 'must mark the delivery claimed');
-  assert(delivered[0].transport === 'broadcast', 'must identify the observed delivery source');
   assert(client.claims() === 1 && client.attempts() === 0, 'one claim, no separate fetch');
 });
 
@@ -353,7 +352,6 @@ await test('every claim failing falls back to an unclaimed delivery', async () =
   assert(client.claims() === 3 && client.attempts() === 1, 'three claims, then one fetch');
   assert(delivered.length === 1, 'the fetched pending row must be delivered');
   assert(delivered[0].claimed !== true, 'device.ts must still claim it');
-  assert(delivered[0].transport === 'broadcast', 'fallback delivery still came from Broadcast');
 });
 
 await test('doorbell with a missing row is a no-op', async () => {

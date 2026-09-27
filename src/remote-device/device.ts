@@ -511,8 +511,6 @@ export class MCPDevice {
             return;
         }
 
-        // Count every targeted delivery, including duplicates, before the local claim.
-
         console.log(`🔧 Received tool call ${call_id}: ${tool_name} ${JSON.stringify(tool_args)} metadata: ${JSON.stringify(metadata)}`);
 
         // LOCAL claim first — this is the authoritative guard against executing
