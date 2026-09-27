@@ -936,7 +936,7 @@ export class RemoteChannel {
         }
 
         if (row) {
-            this.dispatchToolCall({ new: row, claimed: true, transport: 'broadcast' });
+            this.dispatchToolCall({ new: row, claimed: true });
             return;
         }
         if (!claimError) {
@@ -968,7 +968,7 @@ export class RemoteChannel {
         ) {
             // No claim landed; device.ts claims it. Do not hand an expired
             // side-effecting call to the executor while it races the reaper.
-            this.dispatchToolCall({ new: current, transport: 'broadcast' });
+            this.dispatchToolCall({ new: current});
         } else {
             // 'executing' reads the same whether our own claim committed with its
             // response lost or another process holding this device_id won it, and

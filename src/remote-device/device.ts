@@ -527,7 +527,6 @@ export class MCPDevice {
         }
         this.rememberCallId(call_id);
 
-        let executing = false;
         try {
             // DB claim second — keeps the row state machine honest, gives
             // cross-restart/cross-process protection, and is observable. It may
@@ -541,7 +540,6 @@ export class MCPDevice {
             }
 
             let result;
-            executing = true;
 
             // Handle 'ping' tool specially
             if (tool_name === 'ping') {
@@ -569,8 +567,6 @@ export class MCPDevice {
                 // Execute other tools using desktop integration
                 result = await this.desktop.callClientTool(tool_name, tool_args, metadata);
             }
-
-            executing = false;
 
             console.log(`✅ Tool call ${tool_name} completed:\r\n ${JSON.stringify(result)}`);
 
