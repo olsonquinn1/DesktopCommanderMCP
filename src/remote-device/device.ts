@@ -534,7 +534,7 @@ export class MCPDevice {
             // fail open (returns true on a transient write error); the local
             // guard above is what makes execution exactly-once. The doorbell
             // path claims before dispatch and marks the payload `claimed`.
-            const claimed = payload.claimed === true || await this.remoteChannel.markCallExecuting(call_id, tool_name, transport);
+            const claimed = payload.claimed === true || await this.remoteChannel.markCallExecuting(call_id);
             if (!claimed) {
                 // markCallExecuting already logged the duplicate-delivery skip.
                 return;

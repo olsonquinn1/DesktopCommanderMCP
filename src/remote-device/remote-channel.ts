@@ -1217,7 +1217,7 @@ export class RemoteChannel {
      * anyway), matching prior behaviour — so device.ts's in-memory guard is what
      * actually guarantees exactly-once within a process.
      */
-    async markCallExecuting(callId: string, toolName?: string, transport?: 'broadcast' | 'mqtt'): Promise<boolean> {
+    async markCallExecuting(callId: string): Promise<boolean> {
         if (!this.client) throw new Error('Client not initialized');
         const { data, error } = await this.client
             .from('mcp_remote_calls')
