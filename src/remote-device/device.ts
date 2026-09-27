@@ -8,6 +8,7 @@ import os from 'os';
 import fs from 'fs/promises';
 import path from 'path';
 import { captureRemote } from '../utils/capture.js';
+import { observeTransport } from './transport-telemetry.js';
 
 export interface MCPDeviceOptions {
     persistSession?: boolean;
@@ -511,6 +512,11 @@ export class MCPDevice {
             return;
         }
 
+        const observation = { callId: call_id, deviceId: this.deviceId, toolName: tool_name };
+
+        // Count every targeted delivery, including duplicates, before the local claim.
+        observeTransport({ stage: 'device_call_received', ...observation });
+        
         console.log(`🔧 Received tool call ${call_id}: ${tool_name} ${JSON.stringify(tool_args)} metadata: ${JSON.stringify(metadata)}`);
 
         // LOCAL claim first — this is the authoritative guard against executing
@@ -568,10 +574,14 @@ export class MCPDevice {
 
             console.log(`✅ Tool call ${tool_name} completed:\r\n ${JSON.stringify(result)}`);
 
-            await this.remoteChannel.updateCallResult(call_id, 'completed', result);
-
+            try {
+                await this.remoteChannel.updateCallResult(call_id, 'completed', result);
+            } finally {
+                observeTransport({ stage: 'tool_call_completed', ...observation});
+            }
         } catch (error: any) {
             console.error(`❌ Tool call ${tool_name} failed:`, error.message);
+            observeTransport({ stage: 'tool_call_failed', ...observation });
             // The failure path must not fail: this method's promise is discarded
             // at every call site, so a throw here becomes an unhandled rejection
             // and takes the device process down.
