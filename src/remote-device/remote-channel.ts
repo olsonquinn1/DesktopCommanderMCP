@@ -1,6 +1,6 @@
 import { createClient, SupabaseClient, Session, UserResponse, User, RealtimeChannel } from '@supabase/supabase-js';
-import { capture, captureRemote } from '../utils/capture.js';
-import { broadcastReceipt, broadcastStage } from './broadcast-analytics.js';
+import { captureRemote } from '../utils/capture.js';
+import { observeTransport } from './transport-telemetry.js';
 import { VERSION } from '../version.js';
 
 const NUL_CHAR = String.fromCharCode(0);
@@ -607,11 +607,9 @@ export class RemoteChannel {
                     'broadcast',
                     { event: 'new_call' },
                     ({ payload }: any) => {
-                        // Capture callback entry before claim/fetch work changes the timestamp.
-                        const arrival = { timestamp_utc: new Date(Date.now()).toISOString(), monotonic_ms: performance.now() };
                         if (!this.shuttingDown) {
-                            const receipt = broadcastReceipt(payload, this.deviceId, this.user?.id, arrival);
-                            if (receipt) void capture(receipt.stage, receipt);
+                            observeTransport({ stage: 'received', payload, deviceId: this.deviceId,
+                                userId: this.user?.id, transport: 'broadcast' });
                         }
                         this.onDoorbell(payload).catch((e: any) => {
                             console.error('[DEBUG] Doorbell handling failed:', e?.message);
@@ -701,7 +699,8 @@ export class RemoteChannel {
         // so a hiccup must not cost a 5-minute timeout.
         let row: any = null;
         let claimError: any = null;
-        const claimStartedAt = performance.now();
+        const claimStart = observeTransport({ stage: 'operation_start', callId, deviceId: this.deviceId,
+            operation: 'claim_fetch', transport: 'broadcast' });
         for (const delayMs of [0, 500, 1500]) {
             if (delayMs > 0) await this.sleep(delayMs);
             const { data, error } = await this.client
@@ -721,16 +720,12 @@ export class RemoteChannel {
             console.debug(`[DEBUG] Doorbell claim attempt failed for ${callId}: ${error.message} — retrying`);
         }
 
-        const claimObservation = broadcastStage(callId, this.deviceId, 'operation_end', {
-            operation: 'claim_fetch',
-            ...(typeof row?.tool_name === 'string' ? { tool_name: row.tool_name } : {}),
-            outcome: row ? 'success' : claimError ? 'failed' : 'skipped',
-            duration_ms: performance.now() - claimStartedAt,
-        });
-        if (claimObservation) void capture(claimObservation.stage, claimObservation);
+        observeTransport({ stage: 'operation_end', callId, deviceId: this.deviceId,
+            toolName: row?.tool_name, operation: 'claim_fetch', operationId: claimStart?.observation_id,
+            transport: 'broadcast' });
 
         if (row) {
-            this.dispatchToolCall({ new: row, claimed: true });
+            this.dispatchToolCall({ new: row, claimed: true, transport: 'broadcast' });
             return;
         }
         if (!claimError) {
@@ -744,20 +739,17 @@ export class RemoteChannel {
 
         // A failed claim may never have reached the database, so read the row
         // back: still 'pending' means nobody holds it and it can be delivered.
-        const readStartedAt = performance.now();
+        const readStart = observeTransport({ stage: 'operation_start', callId, deviceId: this.deviceId,
+            operation: 'fallback_read', transport: 'broadcast' });
         const { data: current, error } = await this.client
             .from('mcp_remote_calls')
             .select('*')
             .eq('id', callId)
             .eq('device_id', this.deviceId)
             .maybeSingle();
-        const readObservation = broadcastStage(callId, this.deviceId, 'operation_end', {
-            operation: 'fallback_read',
-            ...(typeof current?.tool_name === 'string' ? { tool_name: current.tool_name } : {}),
-            outcome: error ? 'failed' : 'success',
-            duration_ms: performance.now() - readStartedAt,
-        });
-        if (readObservation) void capture(readObservation.stage, readObservation);
+        observeTransport({ stage: 'operation_end', callId, deviceId: this.deviceId,
+            toolName: current?.tool_name, operation: 'fallback_read', operationId: readStart?.observation_id,
+            transport: 'broadcast' });
         if (error) {
             console.error(`[DEBUG] Doorbell row fetch failed for ${callId} after claim errors:`, error.message);
             await captureRemote('remote_channel_doorbell_fetch_error', { error });
@@ -765,7 +757,7 @@ export class RemoteChannel {
         }
         if (current?.status === 'pending') {
             // No claim landed; device.ts claims it.
-            this.dispatchToolCall({ new: current });
+            this.dispatchToolCall({ new: current, transport: 'broadcast' });
         } else {
             // 'executing' reads the same whether our own claim committed with its
             // response lost or another process holding this device_id won it, and
@@ -1014,9 +1006,10 @@ export class RemoteChannel {
      * anyway), matching prior behaviour — so device.ts's in-memory guard is what
      * actually guarantees exactly-once within a process.
      */
-    async markCallExecuting(callId: string, toolName?: string): Promise<boolean> {
+    async markCallExecuting(callId: string, toolName?: string, transport?: 'broadcast' | 'mqtt'): Promise<boolean> {
         if (!this.client) throw new Error('Client not initialized');
-        const startedAt = performance.now();
+        const claimStart = observeTransport({ stage: 'operation_start', callId, deviceId: this.deviceId,
+            toolName, operation: 'fallback_claim', transport });
         const { data, error } = await this.client
             .from('mcp_remote_calls')
             .update({ status: 'executing' })
@@ -1024,13 +1017,8 @@ export class RemoteChannel {
             .eq('status', 'pending')
             .select('id');
 
-        const observation = broadcastStage(callId, this.deviceId, 'operation_end', {
-            operation: 'fallback_claim',
-            ...(toolName ? { tool_name: toolName } : {}),
-            outcome: error ? 'unconfirmed' : data?.length ? 'success' : 'skipped',
-            duration_ms: performance.now() - startedAt,
-        });
-        if (observation) void capture(observation.stage, observation);
+        observeTransport({ stage: 'operation_end', callId, deviceId: this.deviceId,
+            toolName, operation: 'fallback_claim', operationId: claimStart?.observation_id, transport });
 
         if (error) {
             console.error('[DEBUG] Failed to mark call executing:', error.message);
@@ -1047,7 +1035,7 @@ export class RemoteChannel {
         return claimed;
     }
 
-    async updateCallResult(callId: string, status: string, result: any = null, errorMessage: string | null = null): Promise<boolean> {
+    async updateCallResult(callId: string, status: string, result: any = null, errorMessage: string | null = null): Promise<void> {
         if (!this.client) throw new Error('Client not initialized');
         const updateData: any = {
             status: status,
@@ -1096,11 +1084,9 @@ export class RemoteChannel {
                     `Result could not be stored (${error.message})`
                 );
             }
-            return false;
         } else {
             // (an UPDATE without .select() returns no row data — log the id)
             console.debug('[DEBUG] Call result updated successfully:', callId);
-            return true;
         }
     }
 

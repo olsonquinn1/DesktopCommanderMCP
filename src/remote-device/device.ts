@@ -7,15 +7,8 @@ import { fileURLToPath } from 'url';
 import os from 'os';
 import fs from 'fs/promises';
 import path from 'path';
-import { capture, captureRemote } from '../utils/capture.js';
-import { broadcastStage } from './broadcast-analytics.js';
-
-function observeCall(callId: string, deviceId: string | undefined, toolName: string, stage: string, fields: Record<string, string | number> = {}): void {
-    try {
-        const observation = broadcastStage(callId, deviceId, stage, { tool_name: toolName, ...fields });
-        if (observation) void capture(observation.stage, observation);
-    } catch { /* Telemetry must not affect execution. */ }
-}
+import { captureRemote } from '../utils/capture.js';
+import { observeTransport } from './transport-telemetry.js';
 
 export interface MCPDeviceOptions {
     persistSession?: boolean;
@@ -434,6 +427,13 @@ export class MCPDevice {
             return;
         }
 
+        const transport: 'broadcast' | 'mqtt' | undefined =
+            payload.transport === 'broadcast' || payload.transport === 'mqtt' ? payload.transport : undefined;
+        const observation = { callId: call_id, deviceId: this.deviceId, toolName: tool_name, transport };
+
+        // Count every targeted delivery, including duplicates, before the local claim.
+        observeTransport({ stage: 'device_call_received', ...observation });
+
         console.log(`🔧 Received tool call ${call_id}: ${tool_name} ${JSON.stringify(tool_args)} metadata: ${JSON.stringify(metadata)}`);
 
         // LOCAL claim first — this is the authoritative guard against executing
@@ -448,23 +448,22 @@ export class MCPDevice {
         }
         this.rememberCallId(call_id);
 
-        let executionStartedAt: number | null = null;
-        let executionFinished = false;
+        let executing = false;
         try {
             // DB claim second — keeps the row state machine honest, gives
             // cross-restart/cross-process protection, and is observable. It may
             // fail open (returns true on a transient write error); the local
             // guard above is what makes execution exactly-once. The doorbell
             // path claims before dispatch and marks the payload `claimed`.
-            const claimed = payload.claimed === true || await this.remoteChannel.markCallExecuting(call_id, tool_name);
+            const claimed = payload.claimed === true || await this.remoteChannel.markCallExecuting(call_id, tool_name, transport);
             if (!claimed) {
                 // markCallExecuting already logged the duplicate-delivery skip.
                 return;
             }
 
             let result;
-            executionStartedAt = performance.now();
-            observeCall(call_id, this.deviceId, tool_name, 'execution_start');
+            executing = true;
+            observeTransport({ stage: 'execution_start', ...observation });
 
             // Handle 'ping' tool specially
             if (tool_name === 'ping') {
@@ -493,25 +492,23 @@ export class MCPDevice {
                 result = await this.desktop.callClientTool(tool_name, tool_args, metadata);
             }
 
-            executionFinished = true;
-            observeCall(call_id, this.deviceId, tool_name, 'execution_finish', {
-                outcome: 'success', duration_ms: performance.now() - executionStartedAt,
-            });
+            executing = false;
+            observeTransport({ stage: 'execution_finish', ...observation });
 
             console.log(`✅ Tool call ${tool_name} completed:\r\n ${JSON.stringify(result)}`);
 
             // The result write itself notifies the server (a DB trigger).
-            const writeStartedAt = performance.now();
-            const written = await this.remoteChannel.updateCallResult(call_id, 'completed', result);
-            observeCall(call_id, this.deviceId, tool_name, 'operation_end', {
-                operation: 'result_write', outcome: written ? 'success' : 'failed', duration_ms: performance.now() - writeStartedAt,
-            });
+            const writeStart = observeTransport({ stage: 'operation_start', ...observation, operation: 'result_write' });
+            try {
+                await this.remoteChannel.updateCallResult(call_id, 'completed', result);
+            } finally {
+                observeTransport({ stage: 'operation_end', ...observation,
+                    operation: 'result_write', operationId: writeStart?.observation_id });
+            }
 
         } catch (error: any) {
-            if (executionStartedAt !== null && !executionFinished) {
-                observeCall(call_id, this.deviceId, tool_name, 'execution_finish', {
-                    outcome: 'failed', duration_ms: performance.now() - executionStartedAt,
-                });
+            if (executing) {
+                observeTransport({ stage: 'execution_finish', ...observation });
             }
             console.error(`❌ Tool call ${tool_name} failed:`, error.message);
             // The failure path must not fail: this method's promise is discarded
@@ -519,11 +516,13 @@ export class MCPDevice {
             // and takes the device process down.
             try {
                 await captureRemote('remote_device_tool_call_failed', { error, tool_name });
-                const writeStartedAt = performance.now();
-                const written = await this.remoteChannel.updateCallResult(call_id, 'failed', null, error.message);
-                observeCall(call_id, this.deviceId, tool_name, 'operation_end', {
-                    operation: 'result_write', outcome: written ? 'success' : 'failed', duration_ms: performance.now() - writeStartedAt,
-                });
+                const writeStart = observeTransport({ stage: 'operation_start', ...observation, operation: 'result_write' });
+                try {
+                    await this.remoteChannel.updateCallResult(call_id, 'failed', null, error.message);
+                } finally {
+                    observeTransport({ stage: 'operation_end', ...observation,
+                        operation: 'result_write', operationId: writeStart?.observation_id });
+                }
             } catch (reportError: any) {
                 console.error(`❌ Could not report failure for ${call_id}:`, reportError?.message);
             }
