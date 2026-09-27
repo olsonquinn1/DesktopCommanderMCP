@@ -115,6 +115,10 @@ function makeFakeClient({ row = null, failFetches = 0, failClaims = 0, lostClaim
         filters[col] = value;
         return builder;
       },
+      // Claims now also guard timeout_at > corrected-now. These transport
+      // tests focus on claim routing/atomicity, so the fake accepts the range
+      // predicate without adding clock behavior of its own.
+      gt: () => builder,
       select: (cols = '*') => {
         selected = cols;
         return builder;
@@ -338,7 +342,10 @@ await test('a claim that reads back executing is never delivered — the claiman
 });
 
 await test('every claim failing falls back to an unclaimed delivery', async () => {
-  const { rc, client } = makeRemoteChannel({ row: { id: 'x', status: 'pending' }, failClaims: 3 });
+  const { rc, client } = makeRemoteChannel({
+    row: { id: 'x', status: 'pending', timeout_at: new Date(Date.now() + 60_000).toISOString() },
+    failClaims: 3,
+  });
   const delivered = [];
   rc.onToolCall = (p) => delivered.push(p);
   rc.sleep = () => Promise.resolve();
@@ -464,8 +471,12 @@ await test('stopHeartbeat halts the self-rescheduling timer', async () => {
 });
 
 // --- 5. Reachability and status writes --------------------------------------
-// `status` is what the server's device selection filters on, so it must
-// follow the private channel's real join state.
+// `status` is what the server's device selection filters on, so it is a claim
+// that this device will run a tool call right now. It follows the private
+// channel's join state AND the local executor probe MCPDevice installs (issue
+// #4). These cases build a bare RemoteChannel, which has no device and so no
+// probe, leaving the join state the only thing under test here; the executor
+// half is covered in test-remote-device-readiness.js.
 
 await test('heartbeat stays silent when no transport is joined', async () => {
   const { rc, client } = makeRemoteChannel();
@@ -474,11 +485,25 @@ await test('heartbeat stays silent when no transport is joined', async () => {
   assert(client.writes.length === 0, 'a deaf device must let the sweep age its row out');
 });
 
-await test('heartbeat writes when the private channel is joined', async () => {
+// Joined is only half of it. The capability the server checks before it will
+// dispatch is written when presence is published, so a joined channel whose
+// presence never landed is undispatchable — and a heartbeat there would keep
+// the row young and online, which is the one thing that stops the server's
+// sweep from correcting it. Reachability is now both.
+await test('heartbeat stays silent when joined but presence was never published', async () => {
   const { rc, client } = makeRemoteChannel();
   rc.channel = makeChannelState('joined');
+  rc.presenceTracked = false;
   await rc.updateHeartbeat(DEVICE_ID);
-  assert(client.writes.length === 1, 'private channel joined = reachable');
+  assert(client.writes.length === 0, 'no presence = no delivery path = let the row age out');
+});
+
+await test('heartbeat writes when the channel is joined and presence is published', async () => {
+  const { rc, client } = makeRemoteChannel();
+  rc.channel = makeChannelState('joined');
+  rc.presenceTracked = true;
+  await rc.updateHeartbeat(DEVICE_ID);
+  assert(client.writes.length === 1, 'joined + presence published = reachable');
 });
 
 await test('status goes offline when the private channel is not joined', async () => {
@@ -517,10 +542,54 @@ await test('concurrent status writes stay ordered', async () => {
 });
 
 // --- 6. Capability withdrawal -----------------------------------------------
-// For a flagged device the server treats absent presence as authoritative
-// offline and applies that overlay before selection, overriding `status`. So a
-// device that cannot join the private channel must stop advertising the flag
-// or it is undispatchable — there is no other transport to fall back on.
+// Presence is dashboard-authoritative, but server dispatch uses DB status +
+// transport_broadcast_v1. A joined broadcast channel therefore stays a valid
+// delivery path through a short Presence-only failure. Genuine channel failure
+// still withdraws after repeated recreate failures.
+
+await test('transient Presence failure keeps a previously proven capability', async () => {
+  const { rc, client } = makeRemoteChannel();
+  rc.transportCapableWritten = true;
+  rc.channel = { state: 'joined', track: async () => 'timed out' };
+
+  await rc.trackPresenceInner(0, 1);
+
+  assert(rc.transportCapableWritten === true, 'short Presence outage must keep broadcast capability');
+  assert(rc.presenceFailureStartedAt !== null, 'Presence grace timer should start');
+  assert(
+    !client.writes.some((w) => w.capabilities && w.capabilities.transport_broadcast_v1 === undefined),
+    'grace period must not write a withdrawn capability'
+  );
+});
+
+await test('sustained Presence failure withdraws after the grace period', async () => {
+  const { rc, client } = makeRemoteChannel();
+  rc.transportCapableWritten = true;
+  rc.channel = { state: 'joined', track: async () => 'timed out' };
+  rc.presenceFailureStartedAt = performance.now() - (6 * 60 * 1000);
+
+  await rc.trackPresenceInner(0, 1);
+
+  assert(rc.transportCapableWritten === false, 'sustained Presence outage must eventually withdraw');
+  const capWrite = client.writes.find((w) => w.capabilities);
+  assert(capWrite, 'withdrawal should write capabilities');
+  assert(
+    capWrite.capabilities.transport_broadcast_v1 === undefined,
+    'withdrawn payload must remove broadcast capability'
+  );
+});
+
+await test('Presence recovery clears the withdrawal grace timer', async () => {
+  const { rc } = makeRemoteChannel();
+  rc.transportCapableWritten = true;
+  rc.presenceFailureStartedAt = performance.now() - 30_000;
+  rc.channel = { state: 'joined', track: async () => 'ok' };
+
+  await rc.trackPresenceInner(0, 1);
+
+  assert(rc.presenceTracked === true, 'Presence should recover');
+  assert(rc.presenceFailureStartedAt === null, 'successful Presence must reset hysteresis');
+});
 
 await test('sustained recreate failure withdraws the transport capability', async () => {
   const { rc, client } = makeRemoteChannel();
