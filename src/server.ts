@@ -15,6 +15,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { getSystemInfo, getOSSpecificGuidance, getPathGuidance, getDevelopmentToolGuidance } from './utils/system-info.js';
+import { homeLabRemoteToolDecision } from './security/homelab-policy.js';
 
 // Get system information once at startup
 const SYSTEM_INFO = getSystemInfo();
@@ -291,8 +292,15 @@ function shouldIncludeTool(toolName: string): boolean {
         }
     }
 
-    // Add more conditional tool logic here as needed
-    // Example: if (toolName === 'some_tool' && currentClient?.name === 'some_client') return false;
+    // HomeLab: a Remote Device is transport, not authority. Do not even
+    // advertise tools that would let the remote caller mutate its own policy.
+    const homeLabDecision = homeLabRemoteToolDecision(
+        toolName,
+        isRemoteClientContext(currentClient?.name),
+    );
+    if (!homeLabDecision.allowed) {
+        return false;
+    }
 
     return true;
 }
@@ -1272,8 +1280,23 @@ async function handleCallToolRequest(request: CallToolRequest): Promise<ServerRe
             }
         }
 
-        // Track tool call
+        // Track every attempt before policy enforcement so denied calls remain
+        // visible in the local audit trail.
         trackToolCall(name, args);
+
+        const homeLabDecision = homeLabRemoteToolDecision(name, isRemoteCall);
+        if (!homeLabDecision.allowed) {
+            telemetryData.homelab_policy_denied = 'true';
+            isError = true;
+            result = {
+                content: [{
+                    type: "text",
+                    text: "HomeLab policy denied this remote tool call: " + homeLabDecision.reason,
+                }],
+                isError: true,
+            };
+            return result;
+        }
 
         // Using a more structured approach with dedicated handlers
         // (result is declared above so the finally block can read execution status)
